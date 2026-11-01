@@ -1,5 +1,4 @@
 # Polite Web Scraper
-A web scraper tha
 
 ## Target Classification
 - **Site:** [Books to scrape](https://books.toscrape.com), a practice website that is part of toscrape.com sandbox
