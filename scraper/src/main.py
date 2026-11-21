@@ -1,6 +1,9 @@
 import requests
 import time
+import json
+import re
 from datetime import datetime, timezone
+from pydantic import BaseModel, field_validator, ValidationError
 from pathlib import Path
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
@@ -15,6 +18,57 @@ USER_AGENT = (
 )
 TIMEOUT_SECONDS = 10
 CACHE_DIR = Path(__file__).resolve().parent.parent / "cache"
+OUTPUT_DIR = Path(__file__).resolve().parent.parent / "output"
+
+
+# Pydantic BaseModel with field validation
+class Record(BaseModel):
+    title: str
+    product_url: str
+    price_gbp: float
+    price_text: str
+    availability_text: str
+    rating_text: str
+    description: str | None = None
+    source_page: str
+    fetched_at: str
+
+    @field_validator(
+        "title",
+        "product_url",
+        "availability_text",
+        "rating_text",
+        "price_text",
+        "source_page",
+        "fetched_at",
+    )
+    @classmethod
+    def check_str(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("String must not be empty.")
+        return value
+
+    @field_validator("price_gbp")
+    @classmethod
+    def check_price(cls, num: float) -> float:
+        if num < 0:
+            raise ValueError("Price must not be negative.")
+        return num
+
+    @field_validator("product_url", "source_page")
+    @classmethod
+    def check_link(cls, link: str) -> str:
+        if not link.startswith("https://"):
+            raise ValueError("Link must start with https://")
+        return link
+
+    @field_validator("rating_text")
+    @classmethod
+    def check_rating(cls, rate: str) -> str:
+        if rate not in ("One", "Two", "Three", "Four", "Five"):
+            raise ValueError("Rating must be from 1 to 5 only.")
+        return rate
 
 
 # Check if robots.txt exists
@@ -120,48 +174,80 @@ def parse_catalogue():
     return books_dict
 
 
+# HELPERS
 def get_text_tag(tag):
     return tag.get_text(strip=True) if tag is not None else None
+
+
+def parse_price(price_text):
+    if price_text is None:
+        return None
+    digits = re.sub(r"[^\d.]", "", price_text)
+    return float(digits) if digits else None
+
+
+def write_to_json(filename, data):
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    with open(OUTPUT_DIR / filename, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
 
 
 def extract_record(product_url, source_page):
     content, was_fetched, fetched_at = download_catalogue(product_url)
     soup = BeautifulSoup(content, "html.parser")
 
+    title_text = get_text_tag(soup.select_one(".product_main > h1"))
+    price_text = get_text_tag(soup.select_one(".product_main > .price_color"))
+    price_gbp = parse_price(price_text)
+    availability_text = get_text_tag(soup.select_one(".product_main > .availability"))
+
     rating_tag = soup.select_one(".product_main > .star-rating")
     rating_text = rating_tag.get("class")[-1] if rating_tag is not None else None
 
-    record = {
-        "title": get_text_tag(soup.select_one(".product_main > h1")),
-        "product_url": product_url,
-        "price_text": get_text_tag(soup.select_one(".product_main > .price_color")),
-        "availability_text": get_text_tag(
-            soup.select_one(".product_main > .availability")
-        ),
-        "rating_text": rating_text,
-        "description": get_text_tag(soup.select_one(".sub-header + p")),
-        "source_page": source_page,
-        "fetched_at": fetched_at,
-    }
+    description = get_text_tag(soup.select_one(".sub-header + p"))
 
     if was_fetched:
         time.sleep(0.5)
 
-    return record
+    try:
+        record = Record(
+            title=title_text,
+            product_url=product_url,
+            price_gbp=price_gbp,
+            price_text=price_text,
+            availability_text=availability_text,
+            rating_text=rating_text,
+            description=description,
+            source_page=source_page,
+            fetched_at=fetched_at,
+        )
+
+    except ValidationError as e:
+        reasons = [
+            f"{'.'.join(map(str, err['loc']))}: {err['msg']}" for err in e.errors()
+        ]
+        return None, {"product_url": product_url, "reasons": reasons}
+
+    return record.model_dump(), None
 
 
 def record_parsed_books(books_dict, limit=None):
-    books_list = []
+    good_records = {}
+    errors = []
 
     for product_url, source_page in list(books_dict.items())[:limit]:
-        record = extract_record(product_url, source_page)
-        books_list.append(record)
+        record, error = extract_record(product_url, source_page)
+        if error is None:
+            good_records[product_url] = record
+        else:
+            errors.append(error)
+    print(f"detail_pages={len(good_records)}")
 
-    print(f"detail_pages={len(books_list)}")
-    return books_list
+    return good_records, errors
 
 
 if __name__ == "__main__":
     books_dict = parse_catalogue()
-    books_list = record_parsed_books(books_dict)
-    print(books_list[0])
+    good_records, errors = record_parsed_books(books_dict)
+    write_to_json("books.json", list(good_records.values()))
+    write_to_json("errors.json", errors)
